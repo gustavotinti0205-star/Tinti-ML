@@ -6,99 +6,65 @@ from statistics import median
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
 
-# =========================
-# Configurações Iniciais
-# =========================
+# Configurações do Mercado Livre
 ML_BASE = "https://api.mercadolibre.com"
 SITE_ID = "MLB"
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-CLIENT_ID = os.getenv("ML_CLIENT_ID")
-CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET")
+# Configurações de Ambiente
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+CLIENT_ID = os.environ.get("ML_CLIENT_ID")
+CLIENT_SECRET = os.environ.get("ML_CLIENT_SECRET")
 
-# Cabeçalhos para parecer um navegador real
+# Headers Ultra Realistas
 DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
     "Accept": "application/json",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
-    "Connection": "keep-alive",
 }
 
-# =========================
-# Funções do Supabase
-# =========================
-def sb_client():
-    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
-def app_state_get(sb, key: str):
-    r = sb.table("app_state").select("value").eq("key", key).limit(1).execute()
-    return r.data[0].get("value") if r.data else None
-
-def app_state_set(sb, key: str, value_json: dict):
-    sb.table("app_state").upsert({"key": key, "value": value_json}).execute()
-
-def get_refresh_token_from_supabase(sb) -> str:
-    v = app_state_get(sb, "ML_REFRESH_TOKEN")
-    if not v: raise RuntimeError("Token não encontrado.")
-    return v["token"]
-
-# =========================
-# Busca com Bypass de Bloqueio (Impersonate)
-# =========================
-def refresh_access_token(refresh_token: str) -> dict:
-    url = f"{ML_BASE}/oauth/token"
-    data = {
+def main():
+    # Inicializa Supabase
+    sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    
+    # Busca Token
+    res_token = sb.table("app_state").select("value").eq("key", "ML_REFRESH_TOKEN").single().execute()
+    refresh_token = res_token.data['value']['token']
+    
+    # Renova Access Token usando curl_cffi para evitar 403
+    auth_data = {
         "grant_type": "refresh_token",
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "refresh_token": refresh_token,
     }
-    # Aqui usamos o impersonate para fingir ser o Chrome
-    r = requests.post(url, data=data, headers=DEFAULT_HEADERS, impersonate="chrome120", timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-def ml_search_auth(term, access_token):
-    url = f"{ML_BASE}/sites/{SITE_ID}/search"
-    params = {"q": term, "limit": 50}
-    headers = dict(DEFAULT_HEADERS)
-    headers["Authorization"] = f"Bearer {access_token}"
     
-    # Busca fingindo ser navegador real
-    r = requests.get(url, params=params, headers=headers, impersonate="chrome120", timeout=25)
-    r.raise_for_status()
-    return r.json()
-
-# =========================
-# Lógica de Mineração
-# =========================
-def main():
-    sb = sb_client()
-    refresh_token = get_refresh_token_from_supabase(sb)
+    r_auth = requests.post(f"{ML_BASE}/oauth/token", data=auth_data, impersonate="chrome110")
+    r_auth.raise_for_status()
+    access_token = r_auth.json()['access_token']
     
-    # Renova o Token
-    token_data = refresh_access_token(refresh_token)
-    access_token = token_data.get("access_token")
-    
-    # Atualiza o refresh_token no banco se ele mudou
-    if token_data.get("refresh_token"):
-        app_state_set(sb, "ML_REFRESH_TOKEN", {"token": token_data["refresh_token"]})
-
+    # Lista de Termos
     termos = ["cadeira ergonômica", "suporte notebook", "luminária led"]
     
     for termo in termos:
-        print(f"🔎 Analisando brechas para: {termo}")
+        print(f"🔎 Analisando: {termo}")
         try:
-            data = ml_search_auth(termo, access_token)
-            results = data.get("results", [])
-            total = data.get("paging", {}).get("total", 0)
+            # Busca com Impersonate
+            search_url = f"{ML_BASE}/sites/{SITE_ID}/search?q={termo}&limit=50"
+            headers = {**DEFAULT_HEADERS, "Authorization": f"Bearer {access_token}"}
             
-            prices = [item["price"] for item in results if item.get("price")]
-            sellers = len(set(item["seller"]["id"] for item in results if item.get("seller")))
+            r = requests.get(search_url, headers=headers, impersonate="chrome110")
+            r.raise_for_status()
             
-            # Cálculo de Oportunidade
+            data = r.json()
+            total = data['paging']['total']
+            results = data.get('results', [])
+            
+            # Lógica simples de Score
+            prices = [item['price'] for item in results if item.get('price')]
+            sellers = len(set(item['seller']['id'] for item in results if item.get('seller')))
             score = (1 / math.log(1 + total)) * (1 / (1 + sellers)) if total > 0 else 0
-
+            
             snapshot = {
                 "run_at": datetime.now(timezone.utc).isoformat(),
                 "term": termo,
@@ -109,7 +75,7 @@ def main():
             }
             
             sb.table("snapshots").insert(snapshot).execute()
-            print(f"✅ Sucesso para {termo}")
+            print(f"✅ Salvo no Supabase: {termo}")
             time.sleep(5)
             
         except Exception as e:

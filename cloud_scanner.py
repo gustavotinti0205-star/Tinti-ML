@@ -1,10 +1,10 @@
 import os
 import time
 import math
-import requests
+# Substitua import requests por:
+from curl_cffi import requests
 from statistics import median
-from datetime import datetime, timedelta, timezone
-from supabase import create_client
+# ... restante igual
 
 # =========================
 # Config
@@ -253,3 +253,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

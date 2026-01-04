@@ -69,14 +69,28 @@ def should_run(sb):
 # ===============================
 def ml_search(term, limit=50, offset=0):
     url = f"{ML_BASE}/sites/{SITE_ID}/search"
-    params = {
-        "q": term,
-        "limit": limit,
-        "offset": offset
+    params = {"q": term, "limit": limit, "offset": offset}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; TintiMLScanner/1.0; +https://github.com/)",
+        "Accept": "application/json",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
     }
-    r = requests.get(url, params=params, timeout=20)
+
+    r = requests.get(url, params=params, headers=headers, timeout=20)
+
+    # Se der 403/429, tenta mais 2 vezes com pausas
+    if r.status_code in (403, 429):
+        time.sleep(2)
+        r = requests.get(url, params=params, headers=headers, timeout=20)
+
+    if r.status_code in (403, 429):
+        time.sleep(5)
+        r = requests.get(url, params=params, headers=headers, timeout=20)
+
     r.raise_for_status()
     return r.json()
+
 
 
 # ===============================

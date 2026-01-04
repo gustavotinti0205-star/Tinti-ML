@@ -4,17 +4,14 @@ import math
 import requests
 from statistics import median
 from datetime import datetime, timedelta, timezone
-
 from supabase import create_client
 
 ML_BASE = "https://api.mercadolibre.com"
 SITE_ID = "MLB"
 
-# Supabase env
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# Mercado Livre env
 CLIENT_ID = os.getenv("ML_CLIENT_ID")
 CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET")
 REFRESH_TOKEN = os.getenv("ML_REFRESH_TOKEN")
@@ -26,39 +23,22 @@ TERMS = [
     "aspirador portátil"
 ]
 
-# --- validação básica de env ---
-def require_env(name: str):
-    val = os.getenv(name)
-    if not val:
-        raise RuntimeError(f"Variável de ambiente ausente: {name}")
-    return val
 
 def sb_client():
-    require_env("SUPABASE_URL")
-    require_env("SUPABASE_SERVICE_ROLE_KEY")
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não configurados.")
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
 
 def cleanup_old_snapshots(sb, days=60):
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     sb.table("snapshots").delete().lt("run_at", cutoff.isoformat()).execute()
     print(f"🧹 Limpeza feita: registros mais antigos que {days} dias removidos")
 
-# --- token cache (evita ficar pedindo token) ---
-_token_cache = {"access_token": None, "fetched_at": None}
 
-def refresh_access_token(force=False):
-    """
-    Troca refresh_token por access_token.
-    Cache: reaproveita por ~45 min para evitar excesso de requests.
-    """
-    require_env("ML_CLIENT_ID")
-    require_env("ML_CLIENT_SECRET")
-    require_env("ML_REFRESH_TOKEN")
-
-    if not force and _token_cache["access_token"] and _token_cache["fetched_at"]:
-        age = (datetime.now(timezone.utc) - _token_cache["fetched_at"]).total_seconds()
-        if age < 45 * 60:  # 45 minutos
-            return _token_cache["access_token"]
+def refresh_access_token():
+    if not CLIENT_ID or not CLIENT_SECRET or not REFRESH_TOKEN:
+        raise RuntimeError("ML_CLIENT_ID / ML_CLIENT_SECRET / ML_REFRESH_TOKEN não configurados.")
 
     url = f"{ML_BASE}/oauth/token"
     data = {
@@ -69,49 +49,81 @@ def refresh_access_token(force=False):
     }
 
     r = requests.post(url, data=data, timeout=30)
+
+    # Se falhar aqui, quase sempre é refresh token inválido/rotacionado
+    if r.status_code in (400, 401, 403):
+        try:
+            details = r.json()
+        except Exception:
+            details = {"raw": r.text}
+        raise RuntimeError(f"Falha ao renovar token (status {r.status_code}). Detalhes: {details}")
+
     r.raise_for_status()
-    token = r.json()["access_token"]
+    j = r.json()
 
-    _token_cache["access_token"] = token
-    _token_cache["fetched_at"] = datetime.now(timezone.utc)
+    access = j.get("access_token")
+    if not access:
+        raise RuntimeError(f"Resposta do refresh sem access_token: {j}")
 
-    return token
+    # IMPORTANTE:
+    # Se o Mercado Livre devolver refresh_token novo (rotação),
+    # você precisa atualizar o secret ML_REFRESH_TOKEN manualmente no GitHub.
+    new_refresh = j.get("refresh_token")
+    if new_refresh and new_refresh != REFRESH_TOKEN:
+        print("⚠️ O Mercado Livre devolveu um NOVO refresh_token (rotação).")
+        print("⚠️ Atualize o secret ML_REFRESH_TOKEN no GitHub com o novo valor.")
+        # Não imprimimos o token aqui por segurança.
 
-def ml_search(term, access_token, limit=50, offset=0, retry=0):
+    return access
+
+
+def ml_search_public(term, limit=50, offset=0):
+    """Busca pública SEM token (muitas vezes evita 403 quando o token está ruim)."""
+    url = f"{ML_BASE}/sites/{SITE_ID}/search"
+    params = {"q": term, "limit": limit, "offset": offset}
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "pt-BR,pt;q=0.9",
+    }
+    r = requests.get(url, params=params, headers=headers, timeout=20)
+
+    if r.status_code == 429:
+        time.sleep(5)
+        r = requests.get(url, params=params, headers=headers, timeout=20)
+
+    r.raise_for_status()
+    return r.json()
+
+
+def ml_search_auth(term, access_token, limit=50, offset=0):
+    """Busca com token. Se der 401/403, tentamos fallback público."""
     url = f"{ML_BASE}/sites/{SITE_ID}/search"
     params = {"q": term, "limit": limit, "offset": offset}
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
-        "User-Agent": "TintiMLScanner/1.0",
+        "User-Agent": "Mozilla/5.0",
         "Accept-Language": "pt-BR,pt;q=0.9",
     }
 
-    r = requests.get(url, params=params, headers=headers, timeout=25)
+    r = requests.get(url, params=params, headers=headers, timeout=20)
 
-    # Rate limit
     if r.status_code == 429:
-        wait = min(5 * (retry + 1), 20)
-        print(f"⏳ 429 (rate limit). Aguardando {wait}s e tentando de novo...")
-        time.sleep(wait)
-        if retry < 3:
-            return ml_search(term, access_token, limit, offset, retry=retry + 1)
-        r.raise_for_status()
+        time.sleep(5)
+        r = requests.get(url, params=params, headers=headers, timeout=20)
 
-    # Token inválido/expirado
+    # Se token estiver ruim, pode vir 401/403.
     if r.status_code in (401, 403):
-        # 403 pode acontecer se token não está válido para aquela requisição.
-        if retry < 1:
-            print("🔁 Token inválido/expirado (401/403). Renovando token e tentando novamente...")
-            new_token = refresh_access_token(force=True)
-            return ml_search(term, new_token, limit, offset, retry=retry + 1)
-        r.raise_for_status()
+        print(f"🔁 Token inválido/expirado ({r.status_code}). Tentando busca pública sem token...")
+        return ml_search_public(term, limit=limit, offset=offset)
 
     r.raise_for_status()
     return r.json()
 
+
 def analyze_term(term, access_token, pages=2):
-    first = ml_search(term, access_token, limit=50, offset=0)
+    first = ml_search_auth(term, access_token)
     total_results = first.get("paging", {}).get("total", 0)
 
     sellers = set()
@@ -119,61 +131,45 @@ def analyze_term(term, access_token, pages=2):
     sample_items = 0
 
     for p in range(pages):
-        data = first if p == 0 else ml_search(term, access_token, limit=50, offset=p * 50)
-
+        data = first if p == 0 else ml_search_auth(term, access_token, offset=p * 50)
         for item in data.get("results", []):
             sid = item.get("seller", {}).get("id")
             price = item.get("price")
-
             if sid:
                 sellers.add(sid)
-            if price is not None:
+            if price:
                 prices.append(price)
-
             sample_items += 1
+        time.sleep(0.3)
 
-        time.sleep(0.25)
-
-    price_median = float(median(prices)) if prices else None
+    price_median = median(prices) if prices else None
     unique_sellers = len(sellers)
 
-    # Score (quanto maior, melhor):
-    # - demanda por vendedor (total_results / sellers)
-    # - favorece faixa de preço boa de margem
     score = None
-    if total_results and unique_sellers:
-        demand_per_seller = total_results / max(unique_sellers, 1)
-        price_factor = 1.0
-        if price_median is not None:
-            if 80 <= price_median <= 400:
-                price_factor = 1.3
-            elif price_median >= 50:
-                price_factor = 1.15
-            else:
-                price_factor = 0.9
-
-        # log para não explodir com termos gigantes
-        score = (math.log10(1 + demand_per_seller)) * price_factor
+    if total_results > 0:
+        score = (1 / math.log(1 + total_results)) * (1 / (1 + unique_sellers))
 
     return {
-        "run_at": datetime.now(timezone.utc).isoformat(),   # ✅ SUA COLUNA
         "term": term,
-        "total_results": int(total_results),
-        "unique_sellers_sample": int(unique_sellers),
-        "sample_items": int(sample_items),
+        "total_results": total_results,
+        "unique_sellers_sample": unique_sellers,
+        "sample_items": sample_items,
         "price_median": price_median,
         "score": score,
+        "run_at": datetime.now(timezone.utc).isoformat()
     }
+
 
 def main():
     sb = sb_client()
 
-    # limpa histórico antigo (60 dias)
+    # 1) Limpa registros antigos
     cleanup_old_snapshots(sb, days=60)
 
-    # pega token uma vez (cache + refresh se precisar)
+    # 2) Tenta renovar token
     access_token = refresh_access_token()
 
+    # 3) Roda termos e salva
     for term in TERMS:
         print(f"🔎 Analisando: {term}")
         try:
@@ -183,6 +179,6 @@ def main():
         except Exception as e:
             print(f"⚠️ Erro no termo '{term}': {e}")
 
+
 if __name__ == "__main__":
     main()
-
